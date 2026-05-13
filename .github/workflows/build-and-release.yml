@@ -1,200 +1,143 @@
-name: EAS Build & Release
+name: Build & Release
 
 on:
   push:
-    branches:
-      - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Build profile'
+        description: 'EAS build profile'
         required: true
-        default: 'preview'
+        default: 'production'
         type: choice
         options:
-          - development
           - preview
           - production
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+env:
+  EAS_PROFILE: ${{ github.event.inputs.profile || 'production' }}
 
 jobs:
   build:
-    name: Build APK
+    name: EAS Local Build (Android)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      # ─── Node.js ───────────────────────────────────────────────────────────────
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --legacy-peer-deps
 
+      # ─── Android SDK (required for eas build --local) ──────────────────────────
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Java (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set environment variables
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+
+      - name: Accept Android licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+
+      - name: Install Android platform & build tools
+        run: |
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.0.12077973" \
+            "cmake;3.22.1"
+
+      # ─── EAS CLI + Local build ─────────────────────────────────────────────────
       - name: Install EAS CLI
         run: npm install -g eas-cli
 
-      - name: Set EXPO_TOKEN
-        run: echo "EXPO_TOKEN=$EXPO_TOKEN" >> $GITHUB_ENV
+      - name: EAS Local Build
+        id: eas
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-
-      - name: Determine profile
-        id: profile
         run: |
-          if [ "${{ github.event.inputs.profile }}" != "" ]; then
-            PROFILE="${{ github.event.inputs.profile }}"
-          elif [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/master" ]; then
-            PROFILE="production"
-          else
-            PROFILE="preview"
+          echo "Running: eas build --platform android --profile $EAS_PROFILE --local --non-interactive"
+          eas build \
+            --platform android \
+            --profile "$EAS_PROFILE" \
+            --local \
+            --non-interactive \
+            --message "GitHub Actions build from ${{ github.sha }}"
+          echo "--- Looking for APK ---"
+          find . -name "*.apk" -type f 2>/dev/null
+
+      # ─── Find APK ────────────────────────────────────────────────────────────
+      - name: Locate APK
+        id: apk
+        run: |
+          APK=$(find . -path "./node_modules" -prune -o -name "*.apk" -type f -print 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK found after build"
+            exit 1
           fi
-          echo "profile=$PROFILE" >> $GITHUB_OUTPUT
-          echo "EAS_PROFILE=$PROFILE" >> $GITHUB_ENV
+          echo "Found APK: $APK"
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "apk_size=$(du -h $APK | cut -f1)" >> $GITHUB_OUTPUT
+          ls -lh "$APK"
 
-      - name: Run EAS build
-        id: build_step
-        env:
-          EAS_PROFILE: ${{ steps.profile.outputs.profile }}
-        run: |
-          eas build --platform android --profile "$EAS_PROFILE" \
-            --non-interactive --json > eas_build.json
-
-          python3 - <<'PYEOF'
-          import json, sys
-
-          with open("eas_build.json") as f:
-            data = json.load(f)
-
-          b = data[0]
-          build_id  = b["id"]
-          status    = b["status"]
-          artifact  = b.get("artifacts", {}).get("url", "")
-
-          with open("_build_id",    "w") as f: f.write(build_id)
-          with open("_build_status", "w") as f: f.write(status)
-          with open("_build_url",    "w") as f: f.write(artifact)
-
-          print(f"Build ID: {build_id}  Status: {status}")
-          if artifact:
-            print("Artifact URL available — build may already be done")
-          else:
-            print("Build is async — will poll for completion")
-          PYEOF
-
-      - name: Set build outputs
-        id: build_meta
-        run: |
-          echo "build_id=$(cat _build_id)"       >> $GITHUB_OUTPUT
-          echo "build_status=$(cat _build_status)" >> $GITHUB_OUTPUT
-          echo "build_url=$(cat _build_url)"     >> $GITHUB_OUTPUT
-
-      - name: Poll until EAS build finishes
-        if: steps.build_meta.outputs.build_status == 'pending'
-        run: |
-          BUILD_ID="${{ steps.build_meta.outputs.build_id }}"
-          MAX_WAIT=2700
-          INTERVAL=90
-          ELAPSED=0
-
-          echo "Polling build $BUILD_ID (up to $MAX_WAIT seconds)..."
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            sleep $INTERVAL
-            ELAPSED=$((ELAPSED + INTERVAL))
-
-            STATUS=$(eas build:list --id "$BUILD_ID" --json 2>/dev/null | \
-              python3 -c "import sys,json; print(json.load(sys.stdin)[0]['status'])" || echo "unknown")
-
-            echo "[${ELAPSED}s] $STATUS"
-
-            if [ "$STATUS" = "finished" ]; then
-              ARTIFACT=$(eas build:list --id "$BUILD_ID" --json 2>/dev/null | \
-                python3 -c "import sys,json; print(json.load(sys.stdin)[0].get('artifacts',{}).get('url',''))")
-              echo "artifact_url=$ARTIFACT" >> $GITHUB_OUTPUT
-              echo "Build finished."
-              exit 0
-            elif [ "$STATUS" = "errored" ] || [ "$STATUS" = "canceled" ]; then
-              echo "Build $STATUS"
-              exit 1
-            fi
-          done
-          echo "Timeout — build may still be running."
-          exit 1
-
-      - name: Download APK
-        if: always()
-        run: |
-          BUILD_ID="${{ steps.build_meta.outputs.build_id }}"
-          eas download --id "$BUILD_ID" --output ./build.apk
-
-      - name: Tag & rename artifact
-        id: version_meta
+      # ─── Version from package.json ─────────────────────────────────────────────
+      - name: Get version
+        id: version
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          SHA=${GITHUB_SHA::7}
-          TAG="v${VERSION}-${SHA}"
-          ASSET="voice-capture-${{ steps.profile.outputs.profile }}-${VERSION}-${SHA}.apk"
-          mv ./build.apk "$ASSET"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v${VERSION}-$(echo '${{ github.sha }}' | cut -c1-7)" >> $GITHUB_OUTPUT
+          echo "release_title=Voice Capture v${VERSION} ($(echo '${{ github.sha }}' | cut -c1-7}))" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
 
-          echo "tag_name=$TAG"     >> $GITHUB_OUTPUT
-          echo "asset_name=$ASSET" >> $GITHUB_OUTPUT
-          echo "version=$VERSION"  >> $GITHUB_OUTPUT
-
+      # ─── Upload artifact ──────────────────────────────────────────────────────
       - name: Upload APK artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: voice-capture-${{ steps.profile.outputs.profile }}-apk
-          path: ${{ steps.version_meta.outputs.asset_name }}
-          retention-days: 14
-          if-no-files-found: error
+          name: voice-capture-android-apk-v${{ steps.version.outputs.version }}
+          path: ${{ steps.apk.outputs.apk_path }}
+          retention-days: 30
 
-      - name: Create GitHub Release (production)
-        if: |
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-          && steps.profile.outputs.profile == 'production'
+      # ─── GitHub Release (auto on push to main) ────────────────────────────────
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version_meta.outputs.tag_name }}
-          name: ${{ steps.version_meta.outputs.tag_name }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.release_title }}
           body: |
-            ## Voice Capture — ${{ steps.version_meta.outputs.version }}
+            ## Voice Capture — Android APK
 
-            **Profile:** `${{ steps.profile.outputs.profile }}`
+            **Version:** `${{ steps.version.outputs.version }}`
+            **Profile:** `${{ env.EAS_PROFILE }}`
             **Commit:** `${{ github.sha }}`
-            **Build ID:** `${{ steps.build_meta.outputs.build_id }}`
+            **Branch:** `${{ github.ref_name }}`
+            **Built by:** EAS local build (GitHub Actions)
 
-            [View on EAS Dashboard](https://expo.dev/accounts/${{ github.repository_owner }}/projects/voice-capture/builds/${{ steps.build_meta.outputs.build_id }})
-
-            Download the APK → enable "Install unknown apps" → install on your Android device.
-          prerelease: false
+            ### Install
+            Download the APK below and install it on your Android device.
+            Enable "Install from unknown sources" in your device settings if prompted.
+          files: ${{ steps.apk.outputs.apk_path }}
+          draft: false
+          prerelease: ${{ env.EAS_PROFILE == 'preview' }}
           generate_release_notes: true
-          files: ${{ steps.version_meta.outputs.asset_name }}
-
-      - name: Create pre-release (non-production)
-        if: |
-          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-          && steps.profile.outputs.profile != 'production'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version_meta.outputs.tag_name }}
-          name: ${{ steps.version_meta.outputs.tag_name }} (${{ steps.profile.outputs.profile }})
-          body: |
-            ## Voice Capture — Preview Build
-
-            **Profile:** `${{ steps.profile.outputs.profile }}`
-            **Commit:** `${{ github.sha }}`
-            **Build ID:** `${{ steps.build_meta.outputs.build_id }}`
-          prerelease: true
-          files: ${{ steps.version_meta.outputs.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
