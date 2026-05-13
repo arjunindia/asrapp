@@ -25,13 +25,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # On main/master → production. On PRs/manual → selected profile.
-  EAS_PROFILE: ${{ github.event.inputs.profile || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' && 'production' || 'preview') }}
-
 jobs:
   build:
-    name: Build APK (${{ env.EAS_PROFILE }})
+    name: Build APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -54,8 +50,23 @@ jobs:
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
+      - name: Determine profile
+        id: profile
+        run: |
+          if [ "${{ github.event.inputs.profile }}" != "" ]; then
+            PROFILE="${{ github.event.inputs.profile }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            PROFILE="production"
+          else
+            PROFILE="preview"
+          fi
+          echo "profile=$PROFILE" >> $GITHUB_OUTPUT
+          echo "EAS_PROFILE=$PROFILE" >> $GITHUB_ENV
+
       - name: Run EAS build
         id: build_step
+        env:
+          EAS_PROFILE: ${{ steps.profile.outputs.profile }}
         run: |
           eas build --platform android --profile "$EAS_PROFILE" \
             --non-interactive --json > eas_build.json
@@ -71,13 +82,13 @@ jobs:
           status    = b["status"]
           artifact  = b.get("artifacts", {}).get("url", "")
 
-          with open("_build_id",   "w") as f: f.write(build_id)
-          with open("_build_status","w") as f: f.write(status)
-          with open("_build_url",   "w") as f: f.write(artifact)
+          with open("_build_id",    "w") as f: f.write(build_id)
+          with open("_build_status", "w") as f: f.write(status)
+          with open("_build_url",    "w") as f: f.write(artifact)
 
           print(f"Build ID: {build_id}  Status: {status}")
           if artifact:
-            print(f"Artifact URL available (build may already be done)")
+            print("Artifact URL available — build may already be done")
           else:
             print("Build is async — will poll for completion")
           PYEOF
@@ -111,7 +122,7 @@ jobs:
               ARTIFACT=$(eas build:list --id "$BUILD_ID" --json 2>/dev/null | \
                 python3 -c "import sys,json; print(json.load(sys.stdin)[0].get('artifacts',{}).get('url',''))")
               echo "artifact_url=$ARTIFACT" >> $GITHUB_OUTPUT
-              echo "Build finished. Artifact URL: $ARTIFACT"
+              echo "Build finished."
               exit 0
             elif [ "$STATUS" = "errored" ] || [ "$STATUS" = "canceled" ]; then
               echo "Build $STATUS"
@@ -133,18 +144,18 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           SHA=${GITHUB_SHA::7}
           TAG="v${VERSION}-${SHA}"
-          ASSET="voice-capture-${{ env.EAS_PROFILE }}-${VERSION}-${SHA}.apk"
+          ASSET="voice-capture-${{ steps.profile.outputs.profile }}-${VERSION}-${SHA}.apk"
           mv ./build.apk "$ASSET"
 
-          echo "tag_name=$TAG"    >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG"     >> $GITHUB_OUTPUT
           echo "asset_name=$ASSET" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION"  >> $GITHUB_OUTPUT
 
       - name: Upload APK artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: voice-capture-${{ env.EAS_PROFILE }}-apk
+          name: voice-capture-${{ steps.profile.outputs.profile }}-apk
           path: ${{ steps.version_meta.outputs.asset_name }}
           retention-days: 14
           if-no-files-found: error
@@ -152,7 +163,7 @@ jobs:
       - name: Create GitHub Release (production)
         if: |
           (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-          && env.EAS_PROFILE == 'production'
+          && steps.profile.outputs.profile == 'production'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version_meta.outputs.tag_name }}
@@ -160,39 +171,30 @@ jobs:
           body: |
             ## Voice Capture — ${{ steps.version_meta.outputs.version }}
 
-            **Profile:** `${{ env.EAS_PROFILE }}`
+            **Profile:** `${{ steps.profile.outputs.profile }}`
             **Commit:** `${{ github.sha }}`
             **Build ID:** `${{ steps.build_meta.outputs.build_id }}`
 
             [View on EAS Dashboard](https://expo.dev/accounts/${{ github.repository_owner }}/projects/voice-capture/builds/${{ steps.build_meta.outputs.build_id }})
 
-            ### Install
-            Download the APK below → enable "Install unknown apps" on your Android device → install.
+            Download the APK → enable "Install unknown apps" → install on your Android device.
           prerelease: false
           generate_release_notes: true
           files: ${{ steps.version_meta.outputs.asset_name }}
-        permissions:
-          contents: write
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create pre-release (non-production)
         if: |
           (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-          && env.EAS_PROFILE != 'production'
+          && steps.profile.outputs.profile != 'production'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version_meta.outputs.tag_name }}
-          name: ${{ steps.version_meta.outputs.tag_name }} (${{ env.EAS_PROFILE }})
+          name: ${{ steps.version_meta.outputs.tag_name }} (${{ steps.profile.outputs.profile }})
           body: |
             ## Voice Capture — Preview Build
 
-            **Profile:** `${{ env.EAS_PROFILE }}`
+            **Profile:** `${{ steps.profile.outputs.profile }}`
             **Commit:** `${{ github.sha }}`
             **Build ID:** `${{ steps.build_meta.outputs.build_id }}`
           prerelease: true
           files: ${{ steps.version_meta.outputs.asset_name }}
-        permissions:
-          contents: write
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
