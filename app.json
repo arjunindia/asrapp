@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Voice Capture",
-    "slug": "voice-capture",
+    "slug": "asrproj",
     "version": "1.0.0",
     "orientation": "portrait",
     "scheme": "voicecapture",
