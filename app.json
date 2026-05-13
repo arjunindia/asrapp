@@ -7,7 +7,6 @@
     "scheme": "voicecapture",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -45,6 +44,9 @@
           "microphonePermission": "Allow Voice Capture to access your microphone for speech recognition."
         }
       ]
-    ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
   }
 }
