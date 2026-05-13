@@ -37,7 +37,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: npm ci
 
       # ─── Android SDK (required for eas build --local) ──────────────────────────
       - name: Setup Android SDK
