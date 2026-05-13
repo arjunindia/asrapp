@@ -1,0 +1,198 @@
+name: EAS Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Build profile'
+        required: true
+        default: 'preview'
+        type: choice
+        options:
+          - development
+          - preview
+          - production
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # On main/master → production. On PRs/manual → selected profile.
+  EAS_PROFILE: ${{ github.event.inputs.profile || (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' && 'production' || 'preview') }}
+
+jobs:
+  build:
+    name: Build APK (${{ env.EAS_PROFILE }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+
+      - name: Set EXPO_TOKEN
+        run: echo "EXPO_TOKEN=$EXPO_TOKEN" >> $GITHUB_ENV
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Run EAS build
+        id: build_step
+        run: |
+          eas build --platform android --profile "$EAS_PROFILE" \
+            --non-interactive --json > eas_build.json
+
+          python3 - <<'PYEOF'
+          import json, sys
+
+          with open("eas_build.json") as f:
+            data = json.load(f)
+
+          b = data[0]
+          build_id  = b["id"]
+          status    = b["status"]
+          artifact  = b.get("artifacts", {}).get("url", "")
+
+          with open("_build_id",   "w") as f: f.write(build_id)
+          with open("_build_status","w") as f: f.write(status)
+          with open("_build_url",   "w") as f: f.write(artifact)
+
+          print(f"Build ID: {build_id}  Status: {status}")
+          if artifact:
+            print(f"Artifact URL available (build may already be done)")
+          else:
+            print("Build is async — will poll for completion")
+          PYEOF
+
+      - name: Set build outputs
+        id: build_meta
+        run: |
+          echo "build_id=$(cat _build_id)"       >> $GITHUB_OUTPUT
+          echo "build_status=$(cat _build_status)" >> $GITHUB_OUTPUT
+          echo "build_url=$(cat _build_url)"     >> $GITHUB_OUTPUT
+
+      - name: Poll until EAS build finishes
+        if: steps.build_meta.outputs.build_status == 'pending'
+        run: |
+          BUILD_ID="${{ steps.build_meta.outputs.build_id }}"
+          MAX_WAIT=2700
+          INTERVAL=90
+          ELAPSED=0
+
+          echo "Polling build $BUILD_ID (up to $MAX_WAIT seconds)..."
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+
+            STATUS=$(eas build:list --id "$BUILD_ID" --json 2>/dev/null | \
+              python3 -c "import sys,json; print(json.load(sys.stdin)[0]['status'])" || echo "unknown")
+
+            echo "[${ELAPSED}s] $STATUS"
+
+            if [ "$STATUS" = "finished" ]; then
+              ARTIFACT=$(eas build:list --id "$BUILD_ID" --json 2>/dev/null | \
+                python3 -c "import sys,json; print(json.load(sys.stdin)[0].get('artifacts',{}).get('url',''))")
+              echo "artifact_url=$ARTIFACT" >> $GITHUB_OUTPUT
+              echo "Build finished. Artifact URL: $ARTIFACT"
+              exit 0
+            elif [ "$STATUS" = "errored" ] || [ "$STATUS" = "canceled" ]; then
+              echo "Build $STATUS"
+              exit 1
+            fi
+          done
+          echo "Timeout — build may still be running."
+          exit 1
+
+      - name: Download APK
+        if: always()
+        run: |
+          BUILD_ID="${{ steps.build_meta.outputs.build_id }}"
+          eas download --id "$BUILD_ID" --output ./build.apk
+
+      - name: Tag & rename artifact
+        id: version_meta
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SHA=${GITHUB_SHA::7}
+          TAG="v${VERSION}-${SHA}"
+          ASSET="voice-capture-${{ env.EAS_PROFILE }}-${VERSION}-${SHA}.apk"
+          mv ./build.apk "$ASSET"
+
+          echo "tag_name=$TAG"    >> $GITHUB_OUTPUT
+          echo "asset_name=$ASSET" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-capture-${{ env.EAS_PROFILE }}-apk
+          path: ${{ steps.version_meta.outputs.asset_name }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Create GitHub Release (production)
+        if: |
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+          && env.EAS_PROFILE == 'production'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version_meta.outputs.tag_name }}
+          name: ${{ steps.version_meta.outputs.tag_name }}
+          body: |
+            ## Voice Capture — ${{ steps.version_meta.outputs.version }}
+
+            **Profile:** `${{ env.EAS_PROFILE }}`
+            **Commit:** `${{ github.sha }}`
+            **Build ID:** `${{ steps.build_meta.outputs.build_id }}`
+
+            [View on EAS Dashboard](https://expo.dev/accounts/${{ github.repository_owner }}/projects/voice-capture/builds/${{ steps.build_meta.outputs.build_id }})
+
+            ### Install
+            Download the APK below → enable "Install unknown apps" on your Android device → install.
+          prerelease: false
+          generate_release_notes: true
+          files: ${{ steps.version_meta.outputs.asset_name }}
+        permissions:
+          contents: write
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create pre-release (non-production)
+        if: |
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+          && env.EAS_PROFILE != 'production'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version_meta.outputs.tag_name }}
+          name: ${{ steps.version_meta.outputs.tag_name }} (${{ env.EAS_PROFILE }})
+          body: |
+            ## Voice Capture — Preview Build
+
+            **Profile:** `${{ env.EAS_PROFILE }}`
+            **Commit:** `${{ github.sha }}`
+            **Build ID:** `${{ steps.build_meta.outputs.build_id }}`
+          prerelease: true
+          files: ${{ steps.version_meta.outputs.asset_name }}
+        permissions:
+          contents: write
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
